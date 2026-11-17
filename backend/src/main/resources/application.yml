@@ -1,0 +1,28 @@
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/eventflow}
+    username: ${DB_USER:eventflow}
+    password: ${DB_PASSWORD:eventflow}
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  flyway:
+    enabled: true
+server:
+  port: 8080
+  tomcat:
+    max-http-request-header-size: 8KB
+  max-http-request-size: 1MB
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+eventflow:
+  allowed-hosts: ${ALLOWED_WEBHOOK_HOSTS:mock-receiver}
+  worker-enabled: ${WORKER_ENABLED:true}
+  retry-base-seconds: ${RETRY_BASE_SECONDS:5}
+  retry-max-seconds: ${RETRY_MAX_SECONDS:300}
+  lease-seconds: ${LEASE_SECONDS:15}
+  pending-idle-seconds: ${PENDING_IDLE_SECONDS:20}
