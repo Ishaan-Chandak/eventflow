@@ -1,0 +1,77 @@
+name: eventflow-benchmark
+
+x-backend-environment: &backend-environment
+  DB_URL: jdbc:postgresql://postgres:5432/eventflow
+  DB_USER: eventflow
+  DB_PASSWORD: eventflow
+  REDIS_HOST: redis
+  ALLOWED_WEBHOOK_HOSTS: benchmark-receiver
+
+x-backend-dependencies: &backend-dependencies
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  benchmark-receiver:
+    condition: service_started
+
+services:
+  postgres:
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_DB: eventflow
+      POSTGRES_USER: eventflow
+      POSTGRES_PASSWORD: eventflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eventflow"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis:
+    image: redis:7.4.2-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  benchmark-receiver:
+    build: ./receiver
+    environment:
+      RECEIVER_MAX_CONCURRENCY: ${RECEIVER_MAX_CONCURRENCY:-128}
+
+  benchmark-api:
+    build: ../backend
+    environment:
+      <<: *backend-environment
+      WORKER_ENABLED: "false"
+    depends_on: *backend-dependencies
+
+  benchmark-worker:
+    build: ../backend
+    environment:
+      <<: *backend-environment
+      WORKER_ENABLED: "true"
+    depends_on: *backend-dependencies
+
+  benchmark-runner:
+    build: .
+    profiles: ["tools"]
+    environment:
+      BENCHMARK_API_URL: http://benchmark-api:8080
+      BENCHMARK_RECEIVER_URL: http://benchmark-receiver:8082
+      BENCHMARK_POSTGRES_DSN: postgresql://eventflow:eventflow@postgres:5432/eventflow
+      BENCHMARK_MACHINE_JSON: /results/machine.json
+    volumes:
+      - ${BENCHMARK_RESULTS_DIR:-./results}:/results
+    depends_on:
+      benchmark-api:
+        condition: service_started
+      benchmark-worker:
+        condition: service_started
+
+volumes:
+  postgres-data:
