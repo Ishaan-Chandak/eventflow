@@ -3,6 +3,7 @@ param(
     [ValidateRange(0, 2147483647)][int]$WarmupCount = 100,
     [ValidateRange(1, 1024)][int]$PublisherConcurrency = 10,
     [ValidateRange(1, 128)][int]$WorkerCount = 1,
+    [ValidateRange(1, 128)][int]$LocalDeliveryConcurrency = 1,
     [ValidateRange(96, 1048000)][int]$PayloadBytes = 1024,
     [ValidateRange(0, 4900)][int]$ReceiverLatencyMs = 0,
     [ValidateRange(1, 86400)][int]$DrainTimeoutSeconds = 120,
@@ -21,6 +22,7 @@ New-Item -ItemType Directory -Force -Path $resultDirectory | Out-Null
 $composeFile = Join-Path $PSScriptRoot "docker-compose.yml"
 $env:BENCHMARK_RESULTS_DIR = $resultDirectory
 $env:RECEIVER_MAX_CONCURRENCY = $ReceiverMaxConcurrency.ToString()
+$env:LOCAL_DELIVERY_CONCURRENCY = $LocalDeliveryConcurrency.ToString()
 
 $exitCode = 1
 try {

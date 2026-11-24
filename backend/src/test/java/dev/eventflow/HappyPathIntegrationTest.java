@@ -12,6 +12,7 @@ import dev.eventflow.worker.DeliveryPipeline;
 import dev.eventflow.worker.LeaseRecovery;
 import dev.eventflow.worker.RetryScheduler;
 import dev.eventflow.worker.QueueReconciler;
+import dev.eventflow.worker.LocalDeliveryExecutor;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
@@ -28,6 +29,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Executors;
+import java.util.ArrayList;
 import com.sun.net.httpserver.HttpServer;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -46,6 +48,8 @@ class HappyPathIntegrationTest {
         r.add("eventflow.retry-base-seconds",()->"1");
         r.add("eventflow.lease-seconds",()->"6");
         r.add("eventflow.pending-idle-seconds",()->"7");
+        r.add("eventflow.local-concurrency",()->"2");
+        r.add("eventflow.http-request-timeout",()->"2s");
     }
     @Autowired TestRestTemplate client;
     @Autowired JdbcTemplate db;
@@ -54,6 +58,7 @@ class HappyPathIntegrationTest {
     @Autowired LeaseRecovery leaseRecovery;
     @Autowired RetryScheduler retryScheduler;
     @Autowired QueueReconciler queueReconciler;
+    @Autowired LocalDeliveryExecutor deliveryExecutor;
 
     @Test void eventTravelsThroughOutboxStreamAndWorker() throws Exception {
         HttpServer receiver=HttpServer.create(new InetSocketAddress("localhost",0),0);
@@ -79,6 +84,32 @@ class HappyPathIntegrationTest {
         } finally { receiver.stop(0); }
     }
 
+    @Test void localDeliveryConcurrencyDoesNotExceedConfiguredLimit() throws Exception {
+        CountDownLatch entered=new CountDownLatch(2), release=new CountDownLatch(1);
+        AtomicInteger active=new AtomicInteger(), maximum=new AtomicInteger();
+        HttpServer receiver=HttpServer.create(new InetSocketAddress("localhost",0),0);
+        var receiverExecutor=Executors.newFixedThreadPool(4);
+        receiver.setExecutor(receiverExecutor);
+        receiver.createContext("/webhook",exchange->{
+            int now=active.incrementAndGet();maximum.accumulateAndGet(now,Math::max);entered.countDown();
+            try { release.await(3,TimeUnit.SECONDS);exchange.getRequestBody().readAllBytes();exchange.sendResponseHeaders(200,-1); }
+            catch(InterruptedException e) { Thread.currentThread().interrupt(); }
+            finally { active.decrementAndGet();exchange.close(); }
+        });
+        receiver.start();
+        try {
+            var ids=new ArrayList<UUID>();
+            for(int i=0;i<4;i++) ids.add(publish(receiver,"concurrency."+UUID.randomUUID()));
+            assertThat(entered.await(10,TimeUnit.SECONDS)).isTrue();
+            Thread.sleep(250);
+            assertThat(maximum.get()).isEqualTo(2);
+            release.countDown();
+            for(UUID id:ids) awaitStatus(id,"SUCCEEDED",15000);
+        } finally {
+            release.countDown();receiver.stop(0);receiverExecutor.shutdownNow();
+        }
+    }
+
     @Test void serverFailureSchedulesRetryThenSucceeds() throws Exception {
         AtomicInteger status=new AtomicInteger(500);
         HttpServer receiver=receiver(status);
@@ -91,6 +122,51 @@ class HappyPathIntegrationTest {
             awaitStatus(id,"SUCCEEDED",15000);
             assertThat(db.queryForObject("SELECT attempt_count FROM delivery_jobs WHERE id=?",Integer.class,id)).isGreaterThanOrEqualTo(2);
         } finally { receiver.stop(0); }
+    }
+
+    @Test void networkTimeoutIsRecordedAndReturnsLocalCapacity() throws Exception {
+        HttpServer receiver=HttpServer.create(new InetSocketAddress("localhost",0),0);
+        var receiverExecutor=Executors.newCachedThreadPool();
+        receiver.setExecutor(receiverExecutor);
+        receiver.createContext("/webhook",exchange->{
+            try { Thread.sleep(2500);exchange.getRequestBody().readAllBytes();exchange.sendResponseHeaders(200,-1); }
+            catch(InterruptedException e) { Thread.currentThread().interrupt(); }
+            finally { exchange.close(); }
+        });
+        receiver.start();
+        try {
+            UUID id=publish(receiver,"timeout."+UUID.randomUUID());
+            awaitAttemptError(id,"TIMEOUT",10000);
+            long until=System.currentTimeMillis()+2000;
+            while(deliveryExecutor.availableCapacity()<2 && System.currentTimeMillis()<until) Thread.sleep(25);
+            assertThat(deliveryExecutor.availableCapacity()).isEqualTo(2);
+        } finally { receiver.stop(0);receiverExecutor.shutdownNow(); }
+    }
+
+    @Test void responseBodyThatStallsAfterHeadersDoesNotHoldDeliveryCapacity() throws Exception {
+        CountDownLatch headersSent=new CountDownLatch(1), release=new CountDownLatch(1);
+        HttpServer receiver=HttpServer.create(new InetSocketAddress("localhost",0),0);
+        var receiverExecutor=Executors.newSingleThreadExecutor();
+        receiver.setExecutor(receiverExecutor);
+        receiver.createContext("/webhook",exchange->{
+            try {
+                exchange.getRequestBody().readAllBytes();
+                exchange.sendResponseHeaders(200,1024);
+                exchange.getResponseBody().write(1);
+                exchange.getResponseBody().flush();
+                headersSent.countDown();
+                release.await(3,TimeUnit.SECONDS);
+            } catch(Exception ignored) { }
+            finally { exchange.close(); }
+        });
+        receiver.start();
+        try {
+            UUID id=publish(receiver,"stalled-body."+UUID.randomUUID());
+            assertThat(headersSent.await(5,TimeUnit.SECONDS)).isTrue();
+            awaitStatus(id,"SUCCEEDED",1000);
+        } finally {
+            release.countDown();receiver.stop(0);receiverExecutor.shutdownNow();
+        }
     }
 
     @Test void activeLeaseRejectsDuplicateDelivery() throws Exception {
@@ -107,6 +183,7 @@ class HappyPathIntegrationTest {
             UUID id=publish(receiver,"lease.created");
             assertThat(entered.await(10,TimeUnit.SECONDS)).isTrue();
             assertThat(db.queryForObject("SELECT status FROM delivery_jobs WHERE id=?",String.class,id)).isEqualTo("IN_PROGRESS");
+            assertThat(redisTemplate.opsForStream().pending("eventflow:deliveries","delivery-workers").getTotalPendingMessages()).isGreaterThan(0);
             assertThat(pipeline.deliver(id)).isFalse();
             assertThat(requests.get()).isEqualTo(1);
             redisTemplate.opsForStream().add("eventflow:deliveries",Map.of("jobId",id.toString()));
@@ -117,8 +194,49 @@ class HappyPathIntegrationTest {
             assertThat(requests.get()).isEqualTo(1);
             Thread.sleep(7500);
             pipeline.reclaimPending();
-            assertThat(redisTemplate.opsForStream().pending("eventflow:deliveries","delivery-workers").getTotalPendingMessages()).isZero();
+            awaitNoPendingMessages(5000);
         } finally { release.countDown();receiver.stop(0); }
+    }
+
+    @Test void staleSameProcessCompletionCannotFinalizeNewerClaim() throws Exception {
+        AtomicInteger requestNumber=new AtomicInteger();
+        CountDownLatch firstEntered=new CountDownLatch(1), secondEntered=new CountDownLatch(1);
+        CountDownLatch releaseFirst=new CountDownLatch(1), releaseSecond=new CountDownLatch(1);
+        HttpServer receiver=HttpServer.create(new InetSocketAddress("localhost",0),0);
+        var receiverExecutor=Executors.newFixedThreadPool(2);
+        receiver.setExecutor(receiverExecutor);
+        receiver.createContext("/webhook",exchange->{
+            int number=requestNumber.incrementAndGet();
+            CountDownLatch entered=number==1?firstEntered:secondEntered;
+            CountDownLatch release=number==1?releaseFirst:releaseSecond;
+            entered.countDown();
+            try { release.await(3,TimeUnit.SECONDS);exchange.getRequestBody().readAllBytes();exchange.sendResponseHeaders(200,-1); }
+            catch(InterruptedException e) { Thread.currentThread().interrupt(); }
+            finally { exchange.close(); }
+        });
+        receiver.start();
+        var caller=Executors.newSingleThreadExecutor();
+        try {
+            UUID id=publish(receiver,"stale-claim."+UUID.randomUUID());
+            assertThat(firstEntered.await(5,TimeUnit.SECONDS)).isTrue();
+            db.update("UPDATE delivery_jobs SET lease_expires_at=now()-interval '1 second' WHERE id=?",id);
+            leaseRecovery.recover();
+            db.update("UPDATE delivery_jobs SET status='QUEUED',next_attempt_at=NULL WHERE id=?",id);
+            var newer=caller.submit(()->pipeline.deliver(id));
+            assertThat(secondEntered.await(1,TimeUnit.SECONDS)).isTrue();
+
+            releaseFirst.countDown();
+            Thread.sleep(200);
+            assertThat(db.queryForObject("SELECT status FROM delivery_jobs WHERE id=?",String.class,id)).isEqualTo("IN_PROGRESS");
+            releaseSecond.countDown();
+
+            assertThat(newer.get(3,TimeUnit.SECONDS)).isTrue();
+            assertThat(db.queryForObject("SELECT status FROM delivery_jobs WHERE id=?",String.class,id)).isEqualTo("SUCCEEDED");
+            assertThat(db.queryForObject("SELECT count(*) FROM delivery_attempts WHERE delivery_job_id=? AND outcome='UNKNOWN'",Integer.class,id)).isEqualTo(1);
+            assertThat(db.queryForObject("SELECT count(*) FROM delivery_attempts WHERE delivery_job_id=? AND outcome='SUCCESS'",Integer.class,id)).isEqualTo(1);
+        } finally {
+            releaseFirst.countDown();releaseSecond.countDown();caller.shutdownNow();receiver.stop(0);receiverExecutor.shutdownNow();
+        }
     }
 
     @Test void expiredLeaseMarksAttemptUnknownAndRetries() throws Exception {
@@ -248,5 +366,26 @@ class HappyPathIntegrationTest {
             Thread.sleep(100);
         }
         assertThat(actual).isEqualTo(expected);
+    }
+
+    private void awaitNoPendingMessages(long timeoutMs) throws Exception {
+        long until=System.currentTimeMillis()+timeoutMs;
+        long pending=Long.MAX_VALUE;
+        while(System.currentTimeMillis()<until) {
+            pending=redisTemplate.opsForStream().pending("eventflow:deliveries","delivery-workers").getTotalPendingMessages();
+            if(pending==0) return;
+            Thread.sleep(50);
+        }
+        assertThat(pending).isZero();
+    }
+
+    private void awaitAttemptError(UUID id,String expected,long timeoutMs) throws Exception {
+        long until=System.currentTimeMillis()+timeoutMs;
+        while(System.currentTimeMillis()<until) {
+            Integer count=db.queryForObject("SELECT count(*) FROM delivery_attempts WHERE delivery_job_id=? AND error_code=?",Integer.class,id,expected);
+            if(count!=null && count>0) return;
+            Thread.sleep(50);
+        }
+        assertThat(db.queryForObject("SELECT count(*) FROM delivery_attempts WHERE delivery_job_id=? AND error_code=?",Integer.class,id,expected)).isGreaterThan(0);
     }
 }

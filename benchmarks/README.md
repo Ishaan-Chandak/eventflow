@@ -15,7 +15,7 @@ Receiver arrival timestamps are diagnostic only. A delivery counts as complete o
 
 ## Current capacity boundaries
 
-The application currently publishes up to 20 outbox rows per scheduled one-second invocation per backend process. Each backend process reads up to 10 Redis Stream messages per 500 ms invocation and performs outbound HTTP synchronously. Worker count therefore means backend worker containers, not threads inside one process. PostgreSQL conditional claims and `FOR UPDATE SKIP LOCKED` make replica scaling safe. The development mock receiver is deliberately not used because its `HTTPServer` handles one request at a time; the benchmark receiver defaults to 128 bounded concurrent requests.
+The application publishes up to 20 outbox rows per scheduled one-second invocation per backend process. Each worker reserves bounded local capacity before reading Redis Stream messages and performs outbound HTTP on a fixed local executor. `WorkerCount` means backend worker containers; `LocalDeliveryConcurrency` controls the per-container limit. PostgreSQL conditional claims and `FOR UPDATE SKIP LOCKED` make replica scaling safe. The development mock receiver is deliberately not used because its `HTTPServer` handles one request at a time; the benchmark receiver defaults to 128 bounded concurrent requests.
 
 ## Reproducible Docker run
 
@@ -24,7 +24,7 @@ Prerequisites: Docker Desktop with Compose, PowerShell 7 or Windows PowerShell 5
 From the repository root:
 
 ```powershell
-.\benchmarks\run.ps1 -EventCount 10000 -WarmupCount 1000 -PublisherConcurrency 32 -WorkerCount 4 -PayloadBytes 1024 -ReceiverLatencyMs 10
+.\benchmarks\run.ps1 -EventCount 10000 -WarmupCount 1000 -PublisherConcurrency 32 -WorkerCount 1 -LocalDeliveryConcurrency 8 -PayloadBytes 1024 -ReceiverLatencyMs 10
 ```
 
 Every invocation generates a new UUID, Compose project, event type, endpoint, idempotency-key namespace, result directory, PostgreSQL volume, and Redis instance. The exact project and its volumes are removed after the run unless `-KeepStack` is supplied. A warm-up failure aborts measured traffic. A drain timeout writes partial artifacts, marks the summary incomplete, and exits nonzero.
@@ -37,6 +37,7 @@ Important parameters:
 | `WarmupCount` | 100 | at least 0 |
 | `PublisherConcurrency` | 10 | at least 1 |
 | `WorkerCount` | 1 | at least 1 |
+| `LocalDeliveryConcurrency` | 1 | 1-128; per worker process |
 | `PayloadBytes` | 1024 | serialized UTF-8 `payload` JSON bytes, excluding the API envelope |
 | `ReceiverLatencyMs` | 0 | 0–4900; EventFlow's outbound timeout is five seconds |
 | `ReceiverMaxConcurrency` | 128 | bounded receiver request capacity |

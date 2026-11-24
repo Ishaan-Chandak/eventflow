@@ -15,6 +15,12 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual("true", self.services["benchmark-worker"]["environment"]["WORKER_ENABLED"])
         self.assertNotIn("ports", self.services["benchmark-worker"])
 
+    def test_worker_local_concurrency_is_configurable(self):
+        self.assertEqual(
+            "${LOCAL_DELIVERY_CONCURRENCY:-1}",
+            self.services["benchmark-worker"]["environment"]["LOCAL_DELIVERY_CONCURRENCY"],
+        )
+
     def test_stack_uses_benchmark_receiver_and_project_scoped_volumes(self):
         self.assertEqual("./receiver", self.services["benchmark-receiver"]["build"])
         self.assertIn("benchmark-receiver", self.services["benchmark-worker"]["environment"]["ALLOWED_WEBHOOK_HOSTS"])
