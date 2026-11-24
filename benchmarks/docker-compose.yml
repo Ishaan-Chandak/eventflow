@@ -55,6 +55,7 @@ services:
     environment:
       <<: *backend-environment
       WORKER_ENABLED: "true"
+      LOCAL_DELIVERY_CONCURRENCY: ${LOCAL_DELIVERY_CONCURRENCY:-1}
     depends_on: *backend-dependencies
 
   benchmark-runner:

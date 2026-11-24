@@ -22,7 +22,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health,metrics
 eventflow:
   allowed-hosts: ${ALLOWED_WEBHOOK_HOSTS:mock-receiver}
   worker-enabled: ${WORKER_ENABLED:true}
@@ -30,3 +30,6 @@ eventflow:
   retry-max-seconds: ${RETRY_MAX_SECONDS:300}
   lease-seconds: ${LEASE_SECONDS:15}
   pending-idle-seconds: ${PENDING_IDLE_SECONDS:20}
+  local-concurrency: ${LOCAL_DELIVERY_CONCURRENCY:1}
+  shutdown-grace: ${DELIVERY_SHUTDOWN_GRACE:5s}
+  http-request-timeout: ${HTTP_REQUEST_TIMEOUT:5s}

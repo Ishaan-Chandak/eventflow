@@ -11,9 +11,12 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.net.http.*;
+import java.io.InputStream;
 import java.time.Duration;
 import java.time.Instant;
 import java.nio.charset.StandardCharsets;
@@ -21,18 +24,25 @@ import java.util.*;
 
 @Component
 public class DeliveryPipeline {
+    private static final Logger log=LoggerFactory.getLogger(DeliveryPipeline.class);
     private static final String STREAM="eventflow:deliveries", GROUP="delivery-workers";
     private final JdbcTemplate db; private final StringRedisTemplate redis; private final TransactionTemplate tx;
     private final RetryPolicy retryPolicy;
+    private final LocalDeliveryExecutor deliveryExecutor;
+    private final DeliveryMetrics metrics;
     private final HttpClient http=HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).followRedirects(HttpClient.Redirect.NEVER).build();
     private final boolean enabled;
     private final String owner=UUID.randomUUID().toString();
     private final int leaseSeconds;
     private final int pendingIdleSeconds;
+    private final Duration httpRequestTimeout;
     private String pendingCursor="0-0";
-    public DeliveryPipeline(JdbcTemplate db,StringRedisTemplate redis,TransactionTemplate tx,RetryPolicy retryPolicy,@Value("${eventflow.worker-enabled:true}") boolean enabled,@Value("${eventflow.lease-seconds:15}") int leaseSeconds,@Value("${eventflow.pending-idle-seconds:20}") int pendingIdleSeconds) {
-        if(leaseSeconds<=5 || pendingIdleSeconds<=leaseSeconds) throw new IllegalArgumentException("Lease must exceed HTTP timeout and pending idle time must exceed lease");
-        this.db=db;this.redis=redis;this.tx=tx;this.retryPolicy=retryPolicy;this.enabled=enabled;this.leaseSeconds=leaseSeconds;this.pendingIdleSeconds=pendingIdleSeconds;
+    public DeliveryPipeline(JdbcTemplate db,StringRedisTemplate redis,TransactionTemplate tx,RetryPolicy retryPolicy,
+                            LocalDeliveryExecutor deliveryExecutor,DeliveryMetrics metrics,DeliveryProperties properties,
+                            @Value("${eventflow.worker-enabled:true}") boolean enabled) {
+        this.db=db;this.redis=redis;this.tx=tx;this.retryPolicy=retryPolicy;this.deliveryExecutor=deliveryExecutor;
+        this.metrics=metrics;this.enabled=enabled;this.leaseSeconds=properties.getLeaseSeconds();
+        this.pendingIdleSeconds=properties.getPendingIdleSeconds();this.httpRequestTimeout=properties.getHttpRequestTimeout();
     }
 
     @Scheduled(fixedDelay=1000)
@@ -51,53 +61,87 @@ public class DeliveryPipeline {
     @Scheduled(fixedDelay=500)
     public void consume() {
         if(!enabled) return;
+        var permits=deliveryExecutor.reserve(10);
+        if(permits.isEmpty()) return;
         try {
             try { redis.opsForStream().createGroup(STREAM,ReadOffset.from("0-0"),GROUP); } catch(Exception ignored) { /* existing group or absent stream */ }
-            var messages=redis.opsForStream().read(Consumer.from(GROUP,owner),StreamReadOptions.empty().count(10),StreamOffset.create(STREAM,ReadOffset.lastConsumed()));
-            if(messages==null) return;
-            for(var message:messages) {
-                try { if(deliver(UUID.fromString((String)message.getValue().get("jobId")))) redis.opsForStream().acknowledge(STREAM,GROUP,message.getId()); }
-                catch(Exception ignored) { /* keep pending for recovery in later phase */ }
+            var messages=redis.opsForStream().read(Consumer.from(GROUP,owner),StreamReadOptions.empty().count(permits.size()),StreamOffset.create(STREAM,ReadOffset.lastConsumed()));
+            int used=messages==null?0:Math.min(messages.size(),permits.size());
+            for(int i=0;i<used;i++) {
+                var message=messages.get(i);
+                submit(permits.get(i),decode(message.getValue().get("jobId")),message.getId());
             }
-        } catch(Exception ignored) { }
+            for(int i=used;i<permits.size();i++) permits.get(i).close();
+        } catch(Exception e) {
+            permits.forEach(LocalDeliveryExecutor.Permit::close);
+            log.warn("Redis delivery read failed",e);
+        }
     }
 
     @Scheduled(fixedDelay=5000)
     public void reclaimPending() {
         if(!enabled) return;
+        var permits=deliveryExecutor.reserve(20);
+        if(permits.isEmpty()) return;
         try {
             ClaimedMessages<byte[],byte[]> claimed=redis.execute((RedisCallback<ClaimedMessages<byte[],byte[]>>) connection->{
                 @SuppressWarnings("unchecked")
                 RedisAsyncCommands<byte[],byte[]> nativeConnection=(RedisAsyncCommands<byte[],byte[]>)connection.getNativeConnection();
                 var args=new XAutoClaimArgs<byte[]>().consumer(io.lettuce.core.Consumer.from(bytes(GROUP),bytes(owner)))
-                        .minIdleTime(pendingIdleSeconds*1000L).startId(pendingCursor).count(20);
+                        .minIdleTime(pendingIdleSeconds*1000L).startId(pendingCursor).count(permits.size());
                 try { return nativeConnection.xautoclaim(bytes(STREAM),args).get(5,java.util.concurrent.TimeUnit.SECONDS); }
                 catch(Exception e) { throw new IllegalStateException("XAUTOCLAIM failed",e); }
             });
-            if(claimed==null) return;
+            if(claimed==null) { permits.forEach(LocalDeliveryExecutor.Permit::close);return; }
             pendingCursor=claimed.getId();
-            for(var message:claimed.getMessages()) {
+            int used=Math.min(claimed.getMessages().size(),permits.size());
+            for(int i=0;i<used;i++) {
+                var message=claimed.getMessages().get(i);
+                boolean found=false;
                 for(var field:message.getBody().entrySet()) {
                     if(!"jobId".equals(decode(field.getKey()))) continue;
-                    try {
-                        if(deliver(UUID.fromString(decode(field.getValue())))) redis.opsForStream().acknowledge(STREAM,GROUP,RecordId.of(message.getId()));
-                    } catch(Exception ignored) { /* Leave pending for another recovery pass. */ }
+                    submit(permits.get(i),decode(field.getValue()),RecordId.of(message.getId()));
+                    found=true;
                     break;
                 }
+                if(!found) permits.get(i).close();
             }
-        } catch(Exception ignored) { /* Redis may be unavailable. */ }
+            for(int i=used;i<permits.size();i++) permits.get(i).close();
+        } catch(Exception e) {
+            permits.forEach(LocalDeliveryExecutor.Permit::close);
+            log.warn("Redis pending delivery reclaim failed",e);
+        }
+    }
+    private void submit(LocalDeliveryExecutor.Permit permit,String rawJobId,RecordId recordId) {
+        final UUID jobId;
+        try { jobId=UUID.fromString(rawJobId); }
+        catch(Exception e) { permit.close();log.warn("Invalid delivery stream message recordId={} jobId={}",recordId,rawJobId);return; }
+        boolean accepted=permit.submit(()->{
+            try {
+                boolean durable=deliver(jobId);
+                if(durable && deliveryExecutor.isAccepting() && !Thread.currentThread().isInterrupted())
+                    redis.opsForStream().acknowledge(STREAM,GROUP,recordId);
+            } catch(InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("Delivery interrupted jobId={} recordId={}",jobId,recordId);
+            } catch(Exception e) {
+                log.warn("Delivery failed without acknowledgement jobId={} recordId={}",jobId,recordId,e);
+            }
+        },this::consume);
+        if(!accepted) log.warn("Local delivery executor rejected jobId={} recordId={}",jobId,recordId);
     }
     private static byte[] bytes(String value) { return value.getBytes(StandardCharsets.UTF_8); }
     private static String decode(Object value) { return value instanceof byte[] b?new String(b,StandardCharsets.UTF_8):String.valueOf(value); }
     public boolean deliver(UUID id) throws Exception {
+        String claimOwner=owner+":"+UUID.randomUUID();
         Claimed claimed=tx.execute(s->{
-            int changed=db.update("UPDATE delivery_jobs SET status='IN_PROGRESS',attempt_count=attempt_count+1,cycle_attempt_count=cycle_attempt_count+1,lease_owner=?,lease_expires_at=now()+(? * interval '1 second'),updated_at=now() WHERE id=? AND status='QUEUED'",owner,leaseSeconds,id);
+            int changed=db.update("UPDATE delivery_jobs SET status='IN_PROGRESS',attempt_count=attempt_count+1,cycle_attempt_count=cycle_attempt_count+1,lease_owner=?,lease_expires_at=now()+(? * interval '1 second'),updated_at=now() WHERE id=? AND status='QUEUED'",claimOwner,leaseSeconds,id);
             if(changed==0) return null;
             var job=db.queryForMap("SELECT j.event_id,j.attempt_count,j.cycle_attempt_count,j.max_attempts,e.payload,p.url FROM delivery_jobs j JOIN events e ON e.id=j.event_id JOIN webhook_endpoints p ON p.id=j.endpoint_id WHERE j.id=?",id);
             UUID attemptId=UUID.randomUUID();
             int number=((Number)job.get("attempt_count")).intValue();
             db.update("INSERT INTO delivery_attempts(id,delivery_job_id,attempt_number,started_at) VALUES (?,?,?,now())",attemptId,id,number);
-            return new Claimed(job,attemptId,number);
+            return new Claimed(job,attemptId,number,claimOwner);
         });
         if(claimed==null) {
             var states=db.query("SELECT status FROM delivery_jobs WHERE id=?",(rs,n)->rs.getString(1),id);
@@ -108,18 +152,33 @@ public class DeliveryPipeline {
         Instant started=Instant.now();
         int status=0; String errorCode=null;
         try {
-            var request=HttpRequest.newBuilder(URI.create((String)job.get("url"))).timeout(Duration.ofSeconds(5)).header("Content-Type","application/json").header("X-EventFlow-Delivery-Id",id.toString()).header("X-EventFlow-Event-Id",job.get("event_id").toString()).header("X-EventFlow-Attempt",Integer.toString(attempt)).POST(HttpRequest.BodyPublishers.ofString(job.get("payload").toString())).build();
-            status=http.send(request,HttpResponse.BodyHandlers.discarding()).statusCode();
+            var request=HttpRequest.newBuilder(URI.create((String)job.get("url"))).timeout(httpRequestTimeout).header("Content-Type","application/json").header("X-EventFlow-Delivery-Id",id.toString()).header("X-EventFlow-Event-Id",job.get("event_id").toString()).header("X-EventFlow-Attempt",Integer.toString(attempt)).POST(HttpRequest.BodyPublishers.ofString(job.get("payload").toString())).build();
+            HttpResponse<InputStream> response=http.send(request,HttpResponse.BodyHandlers.ofInputStream());
+            status=response.statusCode();
+            try { response.body().close(); } catch(Exception ignored) { /* Status and headers define the result. */ }
         } catch(java.net.http.HttpTimeoutException e) { errorCode="TIMEOUT"; }
+        catch(InterruptedException e) {
+            metrics.recordHttp(Duration.between(started,Instant.now()),DeliveryMetrics.HttpResult.NETWORK_ERROR);
+            Thread.currentThread().interrupt();
+            throw e;
+        }
         catch(Exception e) { errorCode="NETWORK_ERROR"; }
         RetryPolicy.Outcome outcome=retryPolicy.classify(status);
+        DeliveryMetrics.HttpResult httpResult="TIMEOUT".equals(errorCode)?DeliveryMetrics.HttpResult.TIMEOUT:
+                "NETWORK_ERROR".equals(errorCode)?DeliveryMetrics.HttpResult.NETWORK_ERROR:
+                        switch(outcome) {
+                            case SUCCESS -> DeliveryMetrics.HttpResult.SUCCESS;
+                            case TRANSIENT_FAILURE -> DeliveryMetrics.HttpResult.TRANSIENT_FAILURE;
+                            case PERMANENT_FAILURE -> DeliveryMetrics.HttpResult.PERMANENT_FAILURE;
+                        };
+        metrics.recordHttp(Duration.between(started,Instant.now()),httpResult);
         int cycleAttempts=((Number)job.get("cycle_attempt_count")).intValue();
         int maxAttempts=((Number)job.get("max_attempts")).intValue();
         boolean schedule=retryPolicy.shouldRetry(outcome,cycleAttempts,maxAttempts);
         Instant due=schedule ? Instant.now().plus(retryPolicy.delay(cycleAttempts)) : null;
         int finalStatus=status; String finalError=errorCode;
         boolean committed=Boolean.TRUE.equals(tx.execute(s->{
-            int changed=db.update("UPDATE delivery_jobs SET status=?,next_attempt_at=?,last_http_status=?,last_error_code=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=? AND status='IN_PROGRESS' AND lease_owner=?",outcome==RetryPolicy.Outcome.SUCCESS?"SUCCEEDED":schedule?"RETRY_SCHEDULED":"DEAD",due==null?null:java.sql.Timestamp.from(due),finalStatus==0?null:finalStatus,finalError,id,owner);
+            int changed=db.update("UPDATE delivery_jobs SET status=?,next_attempt_at=?,last_http_status=?,last_error_code=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=? AND status='IN_PROGRESS' AND lease_owner=?",outcome==RetryPolicy.Outcome.SUCCESS?"SUCCEEDED":schedule?"RETRY_SCHEDULED":"DEAD",due==null?null:java.sql.Timestamp.from(due),finalStatus==0?null:finalStatus,finalError,id,claimed.leaseOwner());
             if(changed==0) return false;
             db.update("UPDATE delivery_attempts SET finished_at=now(),outcome=?,http_status=?,duration_ms=?,error_code=? WHERE id=?",outcome.name(),finalStatus==0?null:finalStatus,Duration.between(started,Instant.now()).toMillis(),finalError,attemptId);
             return true;
@@ -128,7 +187,10 @@ public class DeliveryPipeline {
             try { redis.opsForZSet().add("eventflow:retry-due",id.toString(),due.toEpochMilli()); }
             catch(Exception ignored) { /* PostgreSQL due time is authoritative. */ }
         }
+        metrics.recordDurableOutcome(!committed?DeliveryMetrics.DurableOutcome.UNFINALIZED:
+                outcome==RetryPolicy.Outcome.SUCCESS?DeliveryMetrics.DurableOutcome.SUCCEEDED:
+                        schedule?DeliveryMetrics.DurableOutcome.RETRY_SCHEDULED:DeliveryMetrics.DurableOutcome.DEAD);
         return committed;
     }
-    private record Claimed(Map<String,Object> job,UUID attemptId,int attemptNumber) {}
+    private record Claimed(Map<String,Object> job,UUID attemptId,int attemptNumber,String leaseOwner) {}
 }
