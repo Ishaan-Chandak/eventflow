@@ -107,9 +107,13 @@ public class LocalDeliveryExecutor {
         }
 
         public boolean submit(Runnable task, Runnable afterCapacityRelease) {
+            return submit(task, afterCapacityRelease, () -> { });
+        }
+
+        public boolean submit(Runnable task, Runnable afterCapacityRelease, Runnable onCancel) {
             if (!owned.compareAndSet(true, false)) throw new IllegalStateException("permit already used");
             try {
-                executor.execute(new DeliveryTask(task, afterCapacityRelease));
+                executor.execute(new DeliveryTask(task, afterCapacityRelease, onCancel));
                 return true;
             } catch (RejectedExecutionException e) {
                 available.release();
@@ -127,11 +131,13 @@ public class LocalDeliveryExecutor {
     private final class DeliveryTask implements Runnable {
         private final Runnable delegate;
         private final Runnable afterCapacityRelease;
+        private final Runnable onCancel;
         private final AtomicBoolean capacityOwned = new AtomicBoolean(true);
 
-        private DeliveryTask(Runnable delegate, Runnable afterCapacityRelease) {
+        private DeliveryTask(Runnable delegate, Runnable afterCapacityRelease, Runnable onCancel) {
             this.delegate = delegate;
             this.afterCapacityRelease = afterCapacityRelease;
+            this.onCancel = onCancel;
         }
 
         @Override
@@ -143,7 +149,12 @@ public class LocalDeliveryExecutor {
             }
         }
 
-        private void cancel() { releaseCapacity(); }
+        private void cancel() {
+            if (capacityOwned.get()) {
+                try { onCancel.run(); } catch (RuntimeException ignored) { }
+            }
+            releaseCapacity();
+        }
         private void releaseCapacity() {
             if (capacityOwned.compareAndSet(true, false)) available.release();
         }

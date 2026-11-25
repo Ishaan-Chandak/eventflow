@@ -13,6 +13,7 @@ import dev.eventflow.worker.LeaseRecovery;
 import dev.eventflow.worker.RetryScheduler;
 import dev.eventflow.worker.QueueReconciler;
 import dev.eventflow.worker.LocalDeliveryExecutor;
+import dev.eventflow.worker.DistributedAdmissionController;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
@@ -49,6 +50,8 @@ class HappyPathIntegrationTest {
         r.add("eventflow.lease-seconds",()->"6");
         r.add("eventflow.pending-idle-seconds",()->"7");
         r.add("eventflow.local-concurrency",()->"2");
+        r.add("eventflow.global-concurrency",()->"3");
+        r.add("eventflow.endpoint-concurrency",()->"2");
         r.add("eventflow.http-request-timeout",()->"2s");
     }
     @Autowired TestRestTemplate client;
@@ -59,6 +62,7 @@ class HappyPathIntegrationTest {
     @Autowired RetryScheduler retryScheduler;
     @Autowired QueueReconciler queueReconciler;
     @Autowired LocalDeliveryExecutor deliveryExecutor;
+    @Autowired DistributedAdmissionController admission;
 
     @Test void eventTravelsThroughOutboxStreamAndWorker() throws Exception {
         HttpServer receiver=HttpServer.create(new InetSocketAddress("localhost",0),0);
@@ -107,6 +111,40 @@ class HappyPathIntegrationTest {
             for(UUID id:ids) awaitStatus(id,"SUCCEEDED",15000);
         } finally {
             release.countDown();receiver.stop(0);receiverExecutor.shutdownNow();
+        }
+    }
+
+    @Test void saturatedEndpointConsumesNoAttemptWhileIndependentEndpointProgresses() throws Exception {
+        AtomicInteger status=new AtomicInteger(200);
+        HttpServer receiver=receiver(status);
+        DistributedAdmissionController.Permit firstPermit=null,secondPermit=null;
+        try {
+            String blockedType="blocked."+UUID.randomUUID();
+            var blockedEndpoint=client.postForEntity("/api/v1/endpoints",Map.of("name","blocked","url","http://localhost:"+receiver.getAddress().getPort()+"/webhook","eventTypes",new String[]{blockedType},"enabled",true),Map.class);
+            UUID endpointId=UUID.fromString((String)blockedEndpoint.getBody().get("id"));
+            firstPermit=admission.tryAcquire(endpointId).permit();
+            secondPermit=admission.tryAcquire(endpointId).permit();
+
+            var blockedEvent=client.postForEntity("/api/v1/events",Map.of("eventType",blockedType,"payload",Map.of("id","blocked")),Map.class);
+            UUID blockedJob=UUID.fromString((String)((java.util.List<?>)blockedEvent.getBody().get("jobIds")).getFirst());
+            UUID independentJob=publish(receiver,"independent."+UUID.randomUUID());
+
+            awaitStatus(independentJob,"SUCCEEDED",15000);
+            assertThat(db.queryForObject("SELECT status FROM delivery_jobs WHERE id=?",String.class,blockedJob)).isEqualTo("QUEUED");
+            assertThat(db.queryForObject("SELECT attempt_count FROM delivery_jobs WHERE id=?",Integer.class,blockedJob)).isZero();
+            assertThat(db.queryForObject("SELECT capacity_deferred_until IS NOT NULL FROM delivery_jobs WHERE id=?",Boolean.class,blockedJob)).isTrue();
+            int outboxBefore=db.queryForObject("SELECT count(*) FROM outbox_messages WHERE delivery_job_id=?",Integer.class,blockedJob);
+            db.update("UPDATE delivery_jobs SET updated_at=now()-interval '20 seconds' WHERE id=?",blockedJob);
+            queueReconciler.reconcile();
+            assertThat(db.queryForObject("SELECT count(*) FROM outbox_messages WHERE delivery_job_id=?",Integer.class,blockedJob)).isEqualTo(outboxBefore);
+
+            firstPermit.close();firstPermit=null;
+            secondPermit.close();secondPermit=null;
+            awaitStatus(blockedJob,"SUCCEEDED",20000);
+        } finally {
+            if(firstPermit!=null) firstPermit.close();
+            if(secondPermit!=null) secondPermit.close();
+            receiver.stop(0);
         }
     }
 

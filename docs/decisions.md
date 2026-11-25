@@ -24,3 +24,10 @@
 - Keep page navigation in the URL hash so the demo needs no server-side route handling or router dependency.
 - Poll delivery data every four seconds. WebSockets would add complexity without improving this local demo.
 - Use TypeScript 6.0.3 because the maintained `typescript-eslint` release currently declares support below 6.1; the frontend lockfile records exact resolved dependency versions.
+
+## EventFlow V2 Phase 2 distributed concurrency
+
+- Redis admission is mandatory and fails closed for new HTTP deliveries. The worker acquires a unique-token lease from both the global and endpoint sorted sets before executor submission or PostgreSQL attempt claim.
+- Both keys share `{eventflow:admission}` so one Lua operation can acquire them atomically in Redis Cluster. The resulting single-slot coordinator is an explicit throughput ceiling to measure, accepted in this phase in exchange for exact healthy-state atomicity.
+- Saturated and admission-unavailable entries remain in the Redis Stream PEL. They consume no attempt and become eligible through `XAUTOCLAIM`; PostgreSQL queued-job reconciliation remains the loss-recovery backstop.
+- Permit renewal and release are token-owned. Expiry recovers crashes, but pauses, partitions, failover state loss, or renewal failure can temporarily exceed configured concurrency. PostgreSQL ownership fencing remains authoritative for finalization.

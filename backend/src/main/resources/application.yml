@@ -31,5 +31,10 @@ eventflow:
   lease-seconds: ${LEASE_SECONDS:15}
   pending-idle-seconds: ${PENDING_IDLE_SECONDS:20}
   local-concurrency: ${LOCAL_DELIVERY_CONCURRENCY:1}
+  global-concurrency: ${GLOBAL_DELIVERY_CONCURRENCY:1}
+  endpoint-concurrency: ${ENDPOINT_DELIVERY_CONCURRENCY:1}
+  permit-lease: ${DISTRIBUTED_PERMIT_LEASE:30s}
+  permit-renewal: ${DISTRIBUTED_PERMIT_RENEWAL:10s}
+  capacity-deferral: ${CAPACITY_DEFERRAL:20s}
   shutdown-grace: ${DELIVERY_SHUTDOWN_GRACE:5s}
   http-request-timeout: ${HTTP_REQUEST_TIMEOUT:5s}

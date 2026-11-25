@@ -21,7 +21,7 @@ public class QueueReconciler {
     public void reconcile() {
         if(!enabled) return;
         tx.executeWithoutResult(s->{
-            var ids=db.query("SELECT j.id FROM delivery_jobs j WHERE j.status='QUEUED' AND j.updated_at < now()-interval '10 seconds' AND NOT EXISTS (SELECT 1 FROM outbox_messages o WHERE o.delivery_job_id=j.id AND o.published_at IS NULL) ORDER BY j.updated_at FOR UPDATE OF j SKIP LOCKED LIMIT 100",(rs,n)->rs.getObject(1,UUID.class));
+            var ids=db.query("SELECT j.id FROM delivery_jobs j WHERE j.status='QUEUED' AND (j.capacity_deferred_until IS NULL OR j.capacity_deferred_until <= now()) AND j.updated_at < now()-interval '10 seconds' AND NOT EXISTS (SELECT 1 FROM outbox_messages o WHERE o.delivery_job_id=j.id AND o.published_at IS NULL) ORDER BY j.updated_at FOR UPDATE OF j SKIP LOCKED LIMIT 100",(rs,n)->rs.getObject(1,UUID.class));
             for(UUID id:ids) {
                 db.update("UPDATE delivery_jobs SET updated_at=now() WHERE id=?",id);
                 db.update("INSERT INTO outbox_messages(id,delivery_job_id) VALUES (?,?)",UUID.randomUUID(),id);

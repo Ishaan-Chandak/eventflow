@@ -13,6 +13,28 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class DeliveryMetricsTest {
+
+    @Test
+    void admissionMetricsUseOnlyBoundedResultLabels() {
+        var registry = new SimpleMeterRegistry();
+        var metrics = new DeliveryMetrics(registry);
+
+        metrics.recordAdmission(Duration.ofMillis(5), DeliveryMetrics.AdmissionResult.ACQUIRED);
+        metrics.recordAdmission(Duration.ofMillis(7), DeliveryMetrics.AdmissionResult.ENDPOINT_SATURATED);
+        metrics.recordDeferral(DeliveryMetrics.AdmissionResult.REDIS_UNAVAILABLE);
+        metrics.recordPermitRecovery(2, 3);
+        metrics.recordRenewalFailure(DeliveryMetrics.RenewalFailure.OWNERSHIP_LOST);
+        metrics.recordUtilization(1, 2, 1, 4);
+
+        assertThat(registry.getMeters()).filteredOn(meter -> meter.getId().getName().startsWith("eventflow.delivery.admission"))
+                .allSatisfy(meter -> assertThat(meter.getId().getTags())
+                        .allSatisfy(tag -> assertThat(tag.getKey()).isIn("result", "reason", "scope")));
+        assertThat(registry.get("eventflow.delivery.admission.deferrals").tag("reason", "redis_unavailable").counter().count()).isEqualTo(1);
+        assertThat(registry.get("eventflow.delivery.admission.recovered").tag("scope", "global").counter().count()).isEqualTo(2);
+        assertThat(registry.get("eventflow.delivery.admission.recovered").tag("scope", "endpoint").counter().count()).isEqualTo(3);
+        assertThat(registry.get("eventflow.delivery.admission.global.utilization").gauge().value()).isEqualTo(0.5);
+        assertThat(registry.get("eventflow.delivery.admission.endpoint.utilization").summary().max()).isEqualTo(0.25);
+    }
     @Test
     void recordsOnlyLowCardinalityResultTypes() {
         var registry = new SimpleMeterRegistry();
